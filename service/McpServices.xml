@@ -11,12 +11,15 @@
      <https://creativecommons.org/publicdomain/zero/1.0/>. -->
 
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
     <!-- MCP Services using Moqui's built-in JSON-RPC support -->
-    
-    
-    <service verb="mcp" noun="Initialize" authenticate="true" allow-remote="true" transaction-timeout="30">
+
+
+    <!-- authenticate="anonymous": initialize is a public MCP handshake method per spec;
+         real auth is enforced by EnhancedMcpServlet for all subsequent requests. -->
+    <service verb="mcp" noun="Initialize" authenticate="false" allow-remote="true"
+        transaction-timeout="30">
         <description>Handle MCP initialize request using Moqui authentication</description>
         <in-parameters>
             <parameter name="sessionId" required="false"/>
@@ -86,7 +89,10 @@
 
                 // Fallback to hardcoded instructions if wiki not available
                 if (!instructions) {
-                    instructions = "This server provides access to Moqui ERP through MCP. Use moqui_browse_screens(path='/PopCommerce') to begin. Key screens include: /PopCommerce/Catalog/Product/FindProduct for products, /PopCommerce/Order/FindOrder for orders, and /PopCommerce/Customer for customer management. All screens support parameterized queries for filtering results."
+                    def hasSimpleScreens = ec.factory.getComponentBaseLocations().containsKey("SimpleScreens")
+                    instructions = hasSimpleScreens
+                        ? "This server provides access to Moqui ERP through MCP. Use moqui_browse_screens(path='/PopCommerce') to begin. Key screens include: /PopCommerce/Catalog/Product/FindProduct for products, /PopCommerce/Order/FindOrder for orders, and /PopCommerce/Customer for customer management. All screens support parameterized queries for filtering results."
+                        : "This server provides access to GrowERP through MCP. Use moqui_search_services to find available services, moqui_get_service_details to learn required parameters, and moqui_execute_service to run them."
                 }
                 
                 // Build server capabilities - don't fetch actual tools/resources during init
@@ -148,7 +154,8 @@
         </actions>
     </service>
 
-    <service verb="mcp" noun="ToolsCall" authenticate="true" allow-remote="true" transaction-timeout="300">
+    <service verb="mcp" noun="ToolsCall" authenticate="true" allow-remote="true"
+        transaction-timeout="300">
         <description>Handle MCP tools/call request with direct Moqui service execution</description>
         <in-parameters>
             <parameter name="sessionId" required="false"/>
@@ -174,6 +181,13 @@
 
                     ec.logger.info("MCP ToolsCall: Dispatching tool name=${name}, arguments=${arguments}")
                     ec.logger.info("MCP ToolsCall: CODE VERSION: 2025-01-09 - FIXED NULL CHECK")
+
+                    def hasSimpleScreens = ec.factory.getComponentBaseLocations().containsKey("SimpleScreens")
+                    def screenOnlyTools = ["moqui_browse_screens", "moqui_render_screen", "moqui_search_screens", "moqui_get_screen_details", "moqui_get_help"] as Set
+                    if (!hasSimpleScreens && screenOnlyTools.contains(name)) {
+                        result = [content: [[type: "text", text: "Screen tools are not available in this GrowERP deployment (SimpleScreens component not loaded). Use moqui_search_services, moqui_get_service_details, and moqui_execute_service instead."]], isError: true]
+                        return
+                    }
 
                     if (name == "moqui_render_screen" || name == "moqui_browse_screens") {
                         def targetServiceName = name == "moqui_browse_screens" ? "McpServices.mcp#BrowseScreens" : "McpServices.execute#ScreenAsMcpTool"
@@ -211,6 +225,88 @@
                         }
                         return
                      }
+
+                    if (name == "moqui_execute_service") {
+                        def svcName = arguments?.serviceName
+                        def svcArgs = arguments?.parameters ?: [:]
+                        if (!svcName || !ec.service.isServiceDefined(svcName)) {
+                            throw new Exception("Unknown service name: ${svcName}")
+                        }
+                        def serviceResult = ec.service.sync().name(svcName).parameters(svcArgs).call()
+                        result = [content: [[type: "text", text: new groovy.json.JsonBuilder(serviceResult).toString()]], isError: false]
+                        return
+                    }
+
+                    if (name == "moqui_search_services") {
+                        def query = arguments?.query?.toLowerCase()
+                        if (!query) throw new Exception("Missing query")
+                        def matchedNames = ec.service.getKnownServiceNames()
+                            .findAll { it.startsWith("growerp.") && it.toLowerCase().contains(query) }
+                            .sort()
+                            .take(30)
+                        def services = matchedNames.collect { svcName ->
+                            def info = [name: svcName]
+                            try {
+                                def sd = ec.service.getServiceDefinition(svcName)
+                                if (sd) {
+                                    def descNode = sd.serviceNode.first("description")
+                                    if (descNode?.text) info.description = descNode.text.trim()
+                                    def required = []
+                                    def optional = []
+                                    sd.getInParameterNames().each { pName ->
+                                        def p = sd.getInParameter(pName)
+                                        if (p?.required) required << pName else optional << pName
+                                    }
+                                    if (required) info.required = required
+                                    if (optional) info.optional = optional
+                                }
+                            } catch (sdEx) { }
+                            return info
+                        }
+                        def txt = new groovy.json.JsonBuilder([
+                            total: matchedNames.size(),
+                            services: services,
+                            hint: matchedNames.size() == 30 ? "Showing first 30 matches. Narrow your query for better results." : null
+                        ]).toString()
+                        result = [content: [[type: "text", text: txt]], isError: false]
+                        return
+                    }
+
+                    if (name == "moqui_get_service_details") {
+                        def svcName = arguments?.serviceName
+                        if (!svcName) throw new Exception("Missing serviceName")
+                        def sd = ec.service.getServiceDefinition(svcName)
+                        if (!sd) throw new Exception("Unknown service: ${svcName}")
+                        def descNode = sd.serviceNode.first("description")
+                        def inParams = [:]
+                        sd.getInParameterNames().each { pName ->
+                            def p = sd.getInParameter(pName)
+                            if (p) {
+                                def pInfo = [type: p.type ?: "String", required: p.required ?: false]
+                                def pDescNode = p.parameterNode?.first("description")
+                                if (pDescNode?.text) pInfo.description = pDescNode.text.trim()
+                                inParams[pName] = pInfo
+                            }
+                        }
+                        def outParams = [:]
+                        sd.getOutParameterNames().each { pName ->
+                            def p = sd.getOutParameter(pName)
+                            if (p) {
+                                def pInfo = [type: p.type ?: "String"]
+                                def pDescNode = p.parameterNode?.first("description")
+                                if (pDescNode?.text) pInfo.description = pDescNode.text.trim()
+                                outParams[pName] = pInfo
+                            }
+                        }
+                        def details = [
+                            service: svcName,
+                            description: descNode?.text?.trim() ?: null,
+                            inParameters: inParams,
+                            outParameters: outParams
+                        ]
+                        result = [content: [[type: "text", text: new groovy.json.JsonBuilder(details).toString()]], isError: false]
+                        return
+                    }
 
                     // Fallback: check if it's a general Moqui service (non-screen-based tools)
                     if (ec.service.isServiceDefined(name)) {
@@ -260,7 +356,8 @@
         </actions>
     </service>
 
-    <service verb="mcp" noun="ResourcesList" authenticate="false" allow-remote="true" transaction-timeout="60">
+    <service verb="mcp" noun="ResourcesList" authenticate="false" allow-remote="true"
+        transaction-timeout="60">
         <description>Handle MCP resources/list request with Moqui entity discovery based on user permissions</description>
         <in-parameters>
             <parameter name="sessionId"/>
@@ -322,7 +419,8 @@
         </actions>
     </service>
 
-    <service verb="mcp" noun="ResourcesRead" authenticate="true" allow-remote="true" transaction-timeout="120">
+    <service verb="mcp" noun="ResourcesRead" authenticate="true" allow-remote="true"
+        transaction-timeout="120">
         <description>Handle MCP resources/read request with Moqui entity queries</description>
         <in-parameters>
             <parameter name="sessionId"/>
@@ -370,7 +468,10 @@
 
                     // Fallback to hardcoded instructions
                     if (!instructionsText) {
-                        instructionsText = "This server provides access to Moqui ERP through MCP. Use moqui_browse_screens(path='/PopCommerce') to begin. Key screens include: /PopCommerce/Catalog/Product/FindProduct for products, /PopCommerce/Order/FindOrder for orders, and /PopCommerce/Customer for customer management. All screens support parameterized queries for filtering results."
+                        def hasSimpleScreens = ec.factory.getComponentBaseLocations().containsKey("SimpleScreens")
+                        instructionsText = hasSimpleScreens
+                            ? "This server provides access to Moqui ERP through MCP. Use moqui_browse_screens(path='/PopCommerce') to begin. Key screens include: /PopCommerce/Catalog/Product/FindProduct for products, /PopCommerce/Order/FindOrder for orders, and /PopCommerce/Customer for customer management. All screens support parameterized queries for filtering results."
+                            : "This server provides access to GrowERP through MCP. Use moqui_search_services to find available services, moqui_get_service_details to learn required parameters, and moqui_execute_service to run them."
                     }
 
                     result = [
@@ -476,7 +577,7 @@
             <parameter name="result" type="Map"/>
         </out-parameters>
         <actions>
-          <script><![CDATA[
+            <script><![CDATA[
                 import org.moqui.impl.context.UserFacadeImpl.UserInfo
                 
                 // Get current user information
@@ -527,7 +628,7 @@
     </service>
 
     <!-- Debug Service -->
-    
+
     <service verb="debug" noun="ComponentStatus" authenticate="false" allow-remote="true">
         <description>Debug service to verify component is loaded and working</description>
         <in-parameters/>
@@ -562,14 +663,23 @@
         </actions>
     </service>
 
-    <service verb="execute" noun="ScreenAsMcpTool" authenticate="true" allow-remote="true" transaction-timeout="120">
+    <service verb="execute" noun="ScreenAsMcpTool" authenticate="true" allow-remote="true"
+        transaction-timeout="120">
         <description>Execute a screen as an MCP tool</description>
         <in-parameters>
             <parameter name="path" required="true"/>
-            <parameter name="parameters" type="Map"><description>Parameters to pass to screen</description></parameter>
-            <parameter name="action"><description>Action being processed: if not null, use real screen rendering instead of test mock</description></parameter>
-            <parameter name="renderMode" default="aria"><description>Render mode: aria (default, accessibility tree), text, html</description></parameter>
-            <parameter name="sessionId"><description>Session ID for user context restoration</description></parameter>
+            <parameter name="parameters" type="Map">
+                <description>Parameters to pass to screen</description>
+            </parameter>
+            <parameter name="action">
+                <description>Action being processed: if not null, use real screen rendering instead of test mock</description>
+            </parameter>
+            <parameter name="renderMode" default="aria">
+                <description>Render mode: aria (default, accessibility tree), text, html</description>
+            </parameter>
+            <parameter name="sessionId">
+                <description>Session ID for user context restoration</description>
+            </parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="result" type="Map"/>
@@ -2012,10 +2122,11 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
             ]
         }
     ]]></script>
-</actions>
-</service>
+        </actions>
+    </service>
 
-    <service verb="mcp" noun="ResourcesTemplatesList" authenticate="false" allow-remote="true" transaction-timeout="30">
+    <service verb="mcp" noun="ResourcesTemplatesList" authenticate="false" allow-remote="true"
+        transaction-timeout="30">
         <description>Handle MCP resources/templates/list request</description>
         <in-parameters>
             <parameter name="sessionId"/>
@@ -2036,12 +2147,15 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
             ]]></script>
         </actions>
     </service>
-    
-    <service verb="mcp" noun="ResourcesSubscribe" authenticate="false" allow-remote="true" transaction-timeout="30">
+
+    <service verb="mcp" noun="ResourcesSubscribe" authenticate="false" allow-remote="true"
+        transaction-timeout="30">
         <description>Handle MCP resources/subscribe request</description>
         <in-parameters>
             <parameter name="sessionId"/>
-            <parameter name="uri" required="true"><description>Resource URI to subscribe to</description></parameter>
+            <parameter name="uri" required="true">
+                <description>Resource URI to subscribe to</description>
+            </parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="result" type="Map"/>
@@ -2059,12 +2173,15 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
             ]]></script>
         </actions>
     </service>
-    
-    <service verb="mcp" noun="ResourcesUnsubscribe" authenticate="false" allow-remote="true" transaction-timeout="30">
+
+    <service verb="mcp" noun="ResourcesUnsubscribe" authenticate="false" allow-remote="true"
+        transaction-timeout="30">
         <description>Handle MCP resources/unsubscribe request</description>
         <in-parameters>
             <parameter name="sessionId"/>
-            <parameter name="uri" required="true"><description>Resource URI to unsubscribe from</description></parameter>
+            <parameter name="uri" required="true">
+                <description>Resource URI to unsubscribe from</description>
+            </parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="result" type="Map"/>
@@ -2082,8 +2199,9 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
             ]]></script>
         </actions>
     </service>
-    
-    <service verb="mcp" noun="PromptsList" authenticate="false" allow-remote="true" transaction-timeout="30">
+
+    <service verb="mcp" noun="PromptsList" authenticate="false" allow-remote="true"
+        transaction-timeout="30">
         <description>Handle MCP prompts/list request</description>
         <in-parameters>
             <parameter name="sessionId"/>
@@ -2144,12 +2262,15 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
             ]]></script>
         </actions>
     </service>
-    
-    <service verb="mcp" noun="PromptsGet" authenticate="false" allow-remote="true" transaction-timeout="30">
+
+    <service verb="mcp" noun="PromptsGet" authenticate="false" allow-remote="true"
+        transaction-timeout="30">
         <description>Handle MCP prompts/get request</description>
         <in-parameters>
             <parameter name="sessionId"/>
-            <parameter name="name" required="true"><description>Prompt name to retrieve</description></parameter>
+            <parameter name="name" required="true">
+                <description>Prompt name to retrieve</description>
+            </parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="result" type="Map"/>
@@ -2257,8 +2378,9 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
             ]]></script>
         </actions>
     </service>
-    
-    <service verb="mcp" noun="RootsList" authenticate="false" allow-remote="true" transaction-timeout="30">
+
+    <service verb="mcp" noun="RootsList" authenticate="false" allow-remote="true"
+        transaction-timeout="30">
         <description>Handle MCP roots/list request</description>
         <in-parameters>
             <parameter name="sessionId"/>
@@ -2279,14 +2401,21 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
             ]]></script>
         </actions>
     </service>
-    
-    <service verb="mcp" noun="SamplingCreateMessage" authenticate="false" allow-remote="true" transaction-timeout="30">
+
+    <service verb="mcp" noun="SamplingCreateMessage" authenticate="false" allow-remote="true"
+        transaction-timeout="30">
         <description>Handle MCP sampling/createMessage request</description>
         <in-parameters>
             <parameter name="sessionId"/>
-            <parameter name="messages" type="List"><description>List of messages to sample</description></parameter>
-            <parameter name="maxTokens" type="Integer"><description>Maximum tokens to generate</description></parameter>
-            <parameter name="temperature" type="BigDecimal"><description>Sampling temperature</description></parameter>
+            <parameter name="messages" type="List">
+                <description>List of messages to sample</description>
+            </parameter>
+            <parameter name="maxTokens" type="Integer">
+                <description>Maximum tokens to generate</description>
+            </parameter>
+            <parameter name="temperature" type="BigDecimal">
+                <description>Sampling temperature</description>
+            </parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="result" type="Map"/>
@@ -2304,13 +2433,18 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
             ]]></script>
         </actions>
     </service>
-    
-    <service verb="mcp" noun="ElicitationCreate" authenticate="false" allow-remote="true" transaction-timeout="30">
+
+    <service verb="mcp" noun="ElicitationCreate" authenticate="false" allow-remote="true"
+        transaction-timeout="30">
         <description>Handle MCP elicitation/create request</description>
         <in-parameters>
             <parameter name="sessionId"/>
-            <parameter name="prompt"><description>Prompt for elicitation</description></parameter>
-            <parameter name="context"><description>Context for elicitation</description></parameter>
+            <parameter name="prompt">
+                <description>Prompt for elicitation</description>
+            </parameter>
+            <parameter name="context">
+                <description>Context for elicitation</description>
+            </parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="result" type="Map"/>
@@ -2329,13 +2463,22 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
         </actions>
     </service>
 
-    <service verb="mcp" noun="BrowseScreens" authenticate="false" allow-remote="true" transaction-timeout="60">
+    <service verb="mcp" noun="BrowseScreens" authenticate="false" allow-remote="true"
+        transaction-timeout="60">
         <description>Browse Moqui screens hierarchically to discover functionality. Renders screen content as ARIA accessibility tree by default. Supports action parameter for form submission and transitions.</description>
         <in-parameters>
-            <parameter name="path" required="false"><description>Screen path to browse (e.g. 'PopCommerce'). Leave empty for root apps.</description></parameter>
-            <parameter name="action"><description>Action to process before rendering: null (browse), 'submit' (form), 'create', 'update', or transition name</description></parameter>
-            <parameter name="renderMode" default="aria"><description>Render mode: aria (default, accessibility tree), text, html</description></parameter>
-            <parameter name="parameters" type="Map"><description>Parameters to pass to screen during rendering or action</description></parameter>
+            <parameter name="path" required="false">
+                <description>Screen path to browse (e.g. 'PopCommerce'). Leave empty for root apps.</description>
+            </parameter>
+            <parameter name="action">
+                <description>Action to process before rendering: null (browse), 'submit' (form), 'create', 'update', or transition name</description>
+            </parameter>
+            <parameter name="renderMode" default="aria">
+                <description>Render mode: aria (default, accessibility tree), text, html</description>
+            </parameter>
+            <parameter name="parameters" type="Map">
+                <description>Parameters to pass to screen during rendering or action</description>
+            </parameter>
             <parameter name="sessionId"/>
         </in-parameters>
         <out-parameters>
@@ -2733,7 +2876,8 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
         </actions>
     </service>
 
-    <service verb="mcp" noun="SearchScreens" authenticate="false" allow-remote="true" transaction-timeout="60">
+    <service verb="mcp" noun="SearchScreens" authenticate="false" allow-remote="true"
+        transaction-timeout="60">
         <description>Search for screens by name, path, or description. Builds an index by walking the screen tree.</description>
         <in-parameters>
             <parameter name="query" required="true"/>
@@ -2987,7 +3131,8 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
         </actions>
     </service>
 
-    <service verb="list" noun="Tools" authenticate="false" allow-remote="true" transaction-timeout="60">
+    <service verb="list" noun="Tools" authenticate="false" allow-remote="true"
+        transaction-timeout="60">
         <description>List discovery tools and the unified screen renderer.</description>
         <in-parameters>
             <parameter name="sessionId"/>
@@ -3003,58 +3148,6 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
                 ExecutionContext ec = context.ec
                 
                 def tools = [
-                    [
-                        name: "moqui_browse_screens",
-                        title: "Browse Screens",
-                        description: "Browse Moqui screen hierarchy, process actions, and render screen content. Input 'path' (empty for root). Default renderMode is 'aria'.",
-                        inputSchema: [
-                            type: "object",
-                            properties: [
-                                "path": [type: "string", description: "Path to browse (e.g. 'PopCommerce')"],
-                                "action": [type: "string", description: "Action to process before rendering: null (browse), 'submit' (form), 'create', 'update', or transition name"],
-                                "renderMode": [type: "string", description: "Render mode: aria (default, accessibility tree), text, html"],
-                                "parameters": [type: "object", description: "Parameters to pass to screen during rendering or action"]
-                            ]
-                        ]
-                    ],
-                    [
-                        name: "moqui_search_screens",
-                        title: "Search Screens",
-                        description: "Search for screens by name to find their paths.",
-                        inputSchema: [
-                            type: "object",
-                            properties: [
-                                "query": [type: "string", description: "Search query"]
-                            ],
-                            required: ["query"]
-                        ]
-                     ],
-                     [
-                        name: "moqui_get_screen_details",
-                        title: "Get Screen Details",
-                        description: "Get screen field details including dropdown options. Use this to understand available fields and their options before submitting forms.",
-                        inputSchema: [
-                            type: "object",
-                            properties: [
-                                "path": [type: "string", description: "Screen path to analyze (e.g., 'PopCommerce/PopCommerceAdmin/Party/FindParty')"],
-                                "fieldName": [type: "string", description: "Optional specific field name. If not provided, returns all fields."],
-                                "parameters": [type: "object", description: "Optional parameters to set in context before rendering (for autocomplete contexts)."]
-                            ],
-                            required: ["path"]
-                        ]
-                     ],
-                     [
-                        name: "moqui_get_help",
-                        title: "Get Help",
-                        description: "Fetch extended documentation for a screen or service. Use URIs from 'describedby' fields in ARIA responses.",
-                        inputSchema: [
-                            type: "object",
-                            properties: [
-                                "uri": [type: "string", description: "Help URI (e.g., 'wiki:screen:EditProduct' or 'wiki:service:ProductFeature')"]
-                            ],
-                            required: ["uri"]
-                        ]
-                     ],
                       // moqui_batch_operations - hidden until fixed
                       //
                        [
@@ -3078,6 +3171,43 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
                             ],
                             required: ["name"]
                         ]
+                    ],
+                    [
+                        name: "moqui_search_services",
+                        title: "Search Services",
+                        description: "Search for Moqui services by name, noun, or verb. Returns each match with its description, required parameters, and optional parameters. Use this to answer questions like 'list services', 'what services exist for Product', or 'how do I update a product'. Leave query broad (e.g. 'product', 'order', 'party') to see all related services.",
+                        inputSchema: [
+                            type: "object",
+                            properties: [
+                                "query": [type: "string", description: "Search term (e.g. 'product', 'update#growerp', 'create#mantle'). Use a single keyword to browse a domain."]
+                            ],
+                            required: ["query"]
+                        ]
+                    ],
+                    [
+                        name: "moqui_get_service_details",
+                        title: "Get Service Details",
+                        description: "Get full input and output parameter details for a specific Moqui service, including types and descriptions. Use after moqui_search_services to see all parameters before executing.",
+                        inputSchema: [
+                            type: "object",
+                            properties: [
+                                "serviceName": [type: "string", description: "Full service name (e.g. 'update#growerp.product.Product')"]
+                            ],
+                            required: ["serviceName"]
+                        ]
+                    ],
+                    [
+                        name: "moqui_execute_service",
+                        title: "Execute Service",
+                        description: "Execute a Moqui service directly with parameters. Use moqui_search_services first to find the service name, then moqui_get_service_details to learn required parameters, then call this to run it.",
+                        inputSchema: [
+                            type: "object",
+                            properties: [
+                                "serviceName": [type: "string", description: "Full service name (e.g. 'update#growerp.product.Product')"],
+                                "parameters": [type: "object", description: "Input parameters for the service (required params must be provided)"]
+                            ],
+                            required: ["serviceName"]
+                        ]
                     ]
                 ]
                 
@@ -3086,12 +3216,19 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
         </actions>
     </service>
 
-    <service verb="mcp" noun="GetScreenDetails" authenticate="true" allow-remote="true" transaction-timeout="60">
+    <service verb="mcp" noun="GetScreenDetails" authenticate="true" allow-remote="true"
+        transaction-timeout="60">
         <description>Get screen field details including dropdown options. Use this to understand available fields and their options before submitting forms.</description>
         <in-parameters>
-            <parameter name="path" required="true"><description>Screen path to analyze (e.g., '/PopCommerce/PopCommerceAdmin/Party/FindParty').</description></parameter>
-            <parameter name="fieldName"><description>Optional specific field name. If not provided, returns all fields.</description></parameter>
-            <parameter name="parameters" type="Map"><description>Optional parameters to set in context before rendering (for autocomplete contexts).</description></parameter>
+            <parameter name="path" required="true">
+                <description>Screen path to analyze (e.g., '/PopCommerce/PopCommerceAdmin/Party/FindParty').</description>
+            </parameter>
+            <parameter name="fieldName">
+                <description>Optional specific field name. If not provided, returns all fields.</description>
+            </parameter>
+            <parameter name="parameters" type="Map">
+                <description>Optional parameters to set in context before rendering (for autocomplete contexts).</description>
+            </parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="result" type="Map"/>
@@ -3116,10 +3253,13 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
         </actions>
     </service>
 
-    <service verb="mcp" noun="GetHelp" authenticate="true" allow-remote="true" transaction-timeout="30">
+    <service verb="mcp" noun="GetHelp" authenticate="true" allow-remote="true"
+        transaction-timeout="30">
         <description>Fetch extended documentation for a screen or service. Use URIs from 'describedby' fields in ARIA responses.</description>
         <in-parameters>
-            <parameter name="uri" required="true"><description>Help URI (e.g., 'wiki:screen:EditProduct' or 'wiki:service:ProductFeature')</description></parameter>
+            <parameter name="uri" required="true">
+                <description>Help URI (e.g., 'wiki:screen:EditProduct' or 'wiki:service:ProductFeature')</description>
+            </parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="result" type="Map"/>
@@ -3249,14 +3389,22 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
         </actions>
     </service>
 
-    <!-- NOTE: handle#McpRequest service removed - functionality moved to screen/webapp.xml for unified handling -->
+    <!-- NOTE: handle#McpRequest service removed - functionality moved to screen/webapp.xml for
+    unified handling -->
 
-    <service verb="mcp" noun="BatchOperations" authenticate="true" allow-remote="true" transaction-timeout="120">
+    <service verb="mcp" noun="BatchOperations" authenticate="true" allow-remote="true"
+        transaction-timeout="120">
         <description>Execute multiple screen operations in sequence. Stops on first error by default. Returns results for each operation.</description>
         <in-parameters>
-            <parameter name="operations" type="List" required="true"><description>Array of operations to execute in sequence</description></parameter>
-            <parameter name="stopOnError" type="Boolean" default="true"><description>Stop execution on first error (default: true)</description></parameter>
-            <parameter name="returnLastOnly" type="Boolean" default="false"><description>Return only last operation result (default: false)</description></parameter>
+            <parameter name="operations" type="List" required="true">
+                <description>Array of operations to execute in sequence</description>
+            </parameter>
+            <parameter name="stopOnError" type="Boolean" default="true">
+                <description>Stop execution on first error (default: true)</description>
+            </parameter>
+            <parameter name="returnLastOnly" type="Boolean" default="false">
+                <description>Return only last operation result (default: false)</description>
+            </parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="result" type="Map"/>

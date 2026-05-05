@@ -160,25 +160,41 @@ class EnhancedMcpServlet extends HttpServlet {
                 logger.warn("Web facade initialization warning: ${e.message}")
             }
 
-            // Authentication is handled by MoquiAuthFilter - user context should already be set
+            // Per the MCP specification, 'initialize' and 'ping' are public handshake methods
+            // that must be reachable without prior authentication.  All other methods still
+            // require a valid authenticated session.
             if (!ec.user?.userId) {
-                logger.warn("Enhanced MCP - no authenticated user after MoquiAuthFilter")
-                response.setStatus(HttpServletResponse.SC_UNAUTHORIZED)
-                response.setContentType("application/json")
-                response.writer.write(JsonOutput.toJson([
-                    jsonrpc: "2.0",
-                    error: [code: -32003, message: "Authentication required. Use Basic auth with valid Moqui credentials."],
-                    id: null
-                ]))
-                return
+                // Peek at the JSON-RPC method from the already-read body
+                String rpcMethod = null
+                if (requestBody) {
+                    try {
+                        def peeked = jsonSlurper.parseText(requestBody)
+                        rpcMethod = peeked?.method?.toString()
+                    } catch (Exception ignored) { }
+                }
+
+                // MCP-standard public (unauthenticated) methods
+                boolean isPublicMethod = rpcMethod in ["initialize", "ping", "notifications/initialized"]
+
+                if (!isPublicMethod) {
+                    logger.warn("Enhanced MCP - no authenticated user after MoquiAuthFilter (method: ${rpcMethod})")
+                    response.setStatus(HttpServletResponse.SC_UNAUTHORIZED)
+                    response.setContentType("application/json")
+                    response.writer.write(JsonOutput.toJson([
+                        jsonrpc: "2.0",
+                        error: [code: -32003, message: "Authentication required. Use Basic auth with valid Moqui credentials."],
+                        id: null
+                    ]))
+                    return
+                }
+
+                logger.debug("Allowing unauthenticated MCP public method: ${rpcMethod}")
             }
 
-            // Get Visit created by web facade
+            // Get Visit created by web facade (may be null for stateless API-key auth)
             def visit = ec.user.getVisit()
             if (!visit) {
-                logger.error("Web facade initialized but no Visit created")
-                response.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "Failed to create Visit")
-                return
+                logger.debug("No Visit for request (stateless API-key auth) — proceeding without visit")
             }
 
             // Route based on request method and path
@@ -257,19 +273,33 @@ class EnhancedMcpServlet extends HttpServlet {
         // Create new Visit/session if needed
         if (!visit) {
             try {
-                ec.initWebFacade(webappName, request, response)
+                // initWebFacade was already called in service(); call again only if needed
+                if (!ec.web) {
+                    ec.initWebFacade(webappName, request, response)
+                }
                 visit = ec.user.getVisit()
-                if (!visit) {
-                    throw new Exception("Web facade succeeded but no Visit created")
+
+                if (visit) {
+                    // Session-cookie based auth: use Visit ID as session key
+                    sessionId = visit.visitId?.toString()
+                    sessionAdapter.createSession(sessionId, ec.user.userId?.toString())
+                    logger.info("Created new session ${sessionId} for user ${ec.user.username}")
+                } else {
+                    // Stateless API-key auth: no Visit is created. Use a stable per-user session ID.
+                    if (!ec.user?.userId) {
+                        logger.warn("SSE connection attempted without authenticated user")
+                        response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Authentication required")
+                        return
+                    }
+                    sessionId = "apikey-${ec.user.userId}"
+                    if (!sessionAdapter.hasSession(sessionId)) {
+                        sessionAdapter.createSession(sessionId, ec.user.userId?.toString())
+                    }
+                    logger.info("API-key auth: using stable SSE session ${sessionId} for user ${ec.user.username}")
                 }
 
-                // Create session in adapter with authenticated userId
-                sessionId = visit.visitId?.toString()
-                sessionAdapter.createSession(sessionId, ec.user.userId?.toString())
-                logger.info("Created new session ${sessionId} for user ${ec.user.username}")
-
             } catch (Exception e) {
-                logger.error("Failed to create session: ${e.message}", e)
+                logger.error("Failed to create SSE session: ${e.message}", e)
                 response.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "Failed to create session")
                 return
             }
@@ -309,24 +339,28 @@ class EnhancedMcpServlet extends HttpServlet {
             // Deliver any queued notifications
             transport.deliverQueuedNotifications(sessionId)
 
-            // Keep connection alive with periodic pings
+            // Keep connection alive with periodic pings.
+            // NOTE: response.isCommitted() is TRUE once headers are flushed, so we must NOT
+            // use !isCommitted() as the loop condition — that would exit immediately.
+            // Instead we loop until the writer signals an error (client disconnected).
             int pingCount = 0
-            while (!response.isCommitted() && pingCount < 60) {
+            boolean connectionAlive = true
+            while (connectionAlive && pingCount < 360) {  // max ~30 minutes (360 × 5s)
                 Thread.sleep(5000)
 
-                if (!response.isCommitted()) {
-                    if (!transport.sendPing(sessionId)) {
-                        logger.debug("Ping failed for session ${sessionId}, ending SSE loop")
-                        break
-                    }
+                if (!transport.sendPing(sessionId)) {
+                    logger.debug("Ping failed for session ${sessionId}, ending SSE loop")
+                    connectionAlive = false
+                } else {
                     pingCount++
 
-                    // Update session activity throttled
+                    // Update session activity throttled (every 30s)
                     if (pingCount % 6 == 0) {
                         updateSessionActivityThrottled(sessionId)
                     }
                 }
             }
+            logger.debug("SSE keep-alive loop ended for session ${sessionId} after ${pingCount} pings")
 
         } catch (InterruptedException e) {
             logger.info("SSE connection interrupted for session ${sessionId}")
@@ -517,9 +551,9 @@ class EnhancedMcpServlet extends HttpServlet {
         // Get session ID from header
         String sessionId = request.getHeader("Mcp-Session-Id")
 
-        // For initialize, use visit ID as session ID
-        if (!sessionId && ("initialize".equals(rpcRequest.method) || "notifications/initialized".equals(rpcRequest.method)) && visit) {
-            sessionId = visit.visitId?.toString()
+        // For initialize, use visit ID as session ID (or stable userId-based ID for stateless auth)
+        if (!sessionId && ("initialize".equals(rpcRequest.method) || "notifications/initialized".equals(rpcRequest.method))) {
+            sessionId = visit?.visitId?.toString() ?: "apikey-${ec.user.userId}"
         }
 
         // Validate session ID for non-initialize requests
@@ -660,14 +694,23 @@ class EnhancedMcpServlet extends HttpServlet {
 
             switch (method) {
                 case "initialize":
+                    // Guard: refuse to create an anonymous session (userId=null would produce
+                    // the shared "apikey-null" session key that all unauthenticated clients share).
+                    if (!ec.user.userId) {
+                        logger.warn("MCP initialize rejected: no authenticated user. Provide Basic auth credentials.")
+                        return [error: "Authentication required. Provide Basic auth credentials (e.g. Authorization: Basic <base64(user:password)>)."]
+                    }
                     if (visit && visit.visitId) {
                         params.sessionId = visit.visitId
-                        // Create session in adapter with actual authenticated userId
-                        if (!sessionAdapter.hasSession(params.sessionId?.toString())) {
-                            sessionAdapter.createSession(params.sessionId?.toString(), ec.user.userId?.toString())
-                        }
-                        sessionAdapter.setSessionState(params.sessionId?.toString(), McpSession.STATE_INITIALIZING)
+                    } else if (!params.sessionId) {
+                        // Stateless API-key auth: generate a stable session ID from userId
+                        params.sessionId = "apikey-${ec.user.userId}"
                     }
+                    // Create session in adapter with actual authenticated userId
+                    if (!sessionAdapter.hasSession(params.sessionId?.toString())) {
+                        sessionAdapter.createSession(params.sessionId?.toString(), ec.user.userId?.toString())
+                    }
+                    sessionAdapter.setSessionState(params.sessionId?.toString(), McpSession.STATE_INITIALIZING)
                     params.actualUserId = ec.user.userId
                     def serviceResult = callMcpService("mcp#Initialize", params, ec)
                     if (serviceResult && !serviceResult.error) {

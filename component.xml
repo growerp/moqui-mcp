@@ -26,11 +26,11 @@
     <entity-factory load-data="data/AgentEnumData.xml" />
 
     <!-- Webapp Configuration -->
+    <!-- No McpAuthFilter: EnhancedMcpServlet handles authentication itself,
+         allowing the unauthenticated MCP handshake (initialize/ping) to pass
+         through before requiring credentials for other methods. -->
     <webapp-list>
         <webapp name="webroot">
-            <filter name="McpAuthFilter" class="org.moqui.impl.webapp.MoquiAuthFilter" async-supported="true">
-                <url-pattern>/mcp/*</url-pattern>
-            </filter>
             <servlet name="EnhancedMcpServlet" class="org.moqui.mcp.EnhancedMcpServlet" 
                      load-on-startup="5" async-supported="true">
                 <init-param name="keepAliveIntervalSeconds" value="30"/>
@@ -40,5 +40,4 @@
         </webapp>
     </webapp-list>
 
-    <depends-on name="SimpleScreens" version="2.2.0"/>
 </component>
