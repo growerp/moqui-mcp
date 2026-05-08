@@ -273,13 +273,13 @@ curl -X POST http://localhost:8080/mcp \
 
 **McpChatView** (`flutter/packages/growerp_core/lib/src/mcp/mcp_chat_view.dart`) provides an embedded chat UI for MCP interactions.
 
-**Input syntax:**
+**Input syntax (service tools only — no screen browsing in Flutter):**
 | Prefix | Tool invoked |
 |--------|-------------|
 | `svc <query>` | `moqui_search_services` |
 | `svc! <name>` | `moqui_get_service_details` |
-| Path starting with `/` | `moqui_browse_screens` |
-| Any other text | First matches `menuItems`, then `moqui_search_services` |
+| `exec! <name> {json}` | `moqui_execute_service` |
+| Any other text | First matches `menuItems` (in-app navigation chips), then `moqui_search_services` |
 
 **Features:**
 - JSON-RPC 2.0 over HTTP POST (no SSE required)
