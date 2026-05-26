@@ -42,6 +42,10 @@ import jakarta.servlet.http.HttpServletResponse
 class EnhancedMcpServlet extends HttpServlet {
     protected final static Logger logger = LoggerFactory.getLogger(EnhancedMcpServlet.class)
 
+    private volatile boolean shuttingDown = false
+    private final java.util.concurrent.atomic.AtomicInteger activeSseCount =
+            new java.util.concurrent.atomic.AtomicInteger(0)
+
     private JsonSlurper jsonSlurper = new JsonSlurper()
 
     // Adapter instances
@@ -100,6 +104,25 @@ class EnhancedMcpServlet extends HttpServlet {
         logger.info("EnhancedMcpServlet initialized with adapter architecture for webapp ${webappName}")
         logger.info("SSE endpoint: ${sseEndpoint}, Message endpoint: ${messageEndpoint}")
         logger.info("Keep-alive interval: ${keepAliveIntervalSeconds}s, Max connections: ${maxConnections}")
+
+        // Pre-warm the growerp service name cache in background so the first moqui_search_services
+        // call doesn't incur the getKnownServiceNames() filesystem scan delay.
+        if (ecfi) {
+            final ExecutionContextFactoryImpl ecfiRef = ecfi
+            Thread.start {
+                try {
+                    Thread.sleep(12000) // wait for Moqui to finish startup
+                    def warmEc = ecfiRef.getEci()
+                    try {
+                        org.moqui.mcp.adapter.McpToolAdapter.getCachedGroWerpServiceNames(warmEc)
+                    } finally {
+                        warmEc.destroy()
+                    }
+                } catch (Exception e) {
+                    logger.warn("Service name cache pre-warm failed: ${e.message}")
+                }
+            }
+        }
     }
 
     @Override
@@ -157,7 +180,7 @@ class EnhancedMcpServlet extends HttpServlet {
             try {
                 ec.initWebFacade(webappName, request, response)
             } catch (Exception e) {
-                logger.warn("Web facade initialization warning: ${e.message}")
+                logger.debug("Web facade initialization (non-screen path): ${e.message}")
             }
 
             // Per the MCP specification, 'initialize' and 'ping' are public handshake methods
@@ -285,17 +308,17 @@ class EnhancedMcpServlet extends HttpServlet {
                     sessionAdapter.createSession(sessionId, ec.user.userId?.toString())
                     logger.info("Created new session ${sessionId} for user ${ec.user.username}")
                 } else {
-                    // Stateless API-key auth: no Visit is created. Use a stable per-user session ID.
+                    // Stateless API-key auth: no Visit is created. Use a unique UUID per connection so
+                    // concurrent SSE connections from the same user (e.g. McpToolset reconnects) don't
+                    // overwrite each other's SSE writers and lose in-flight tool call responses.
                     if (!ec.user?.userId) {
                         logger.warn("SSE connection attempted without authenticated user")
                         response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Authentication required")
                         return
                     }
-                    sessionId = "apikey-${ec.user.userId}"
-                    if (!sessionAdapter.hasSession(sessionId)) {
-                        sessionAdapter.createSession(sessionId, ec.user.userId?.toString())
-                    }
-                    logger.info("API-key auth: using stable SSE session ${sessionId} for user ${ec.user.username}")
+                    sessionId = java.util.UUID.randomUUID().toString()
+                    sessionAdapter.createSession(sessionId, ec.user.userId?.toString())
+                    logger.info("API-key auth: created new session ${sessionId} for user ${ec.user.username}")
                 }
 
             } catch (Exception e) {
@@ -322,19 +345,14 @@ class EnhancedMcpServlet extends HttpServlet {
         // Register SSE writer with transport
         transport.registerSseWriter(sessionId, response.writer)
 
+        activeSseCount.incrementAndGet()
         try {
             // Send endpoint event for backwards compatibility
             if (!request.getHeader("Mcp-Session-Id")) {
-                transport.sendSseEventWithId(response.writer, "endpoint", "/mcp", 0)
+                // Determine relative URL for the message endpoint
+                String relativeEndpoint = "/mcp/message?sessionId=" + URLEncoder.encode(sessionId, "UTF-8")
+                transport.sendSseEventWithId(response.writer, "endpoint", relativeEndpoint, 0)
             }
-
-            // Send connect event
-            def connectData = [
-                version: "2.0.2",
-                protocolVersion: "2025-06-18",
-                architecture: "Adapter-based MCP with session registry"
-            ]
-            transport.sendSseEventWithId(response.writer, "connect", JsonOutput.toJson(connectData), 1)
 
             // Deliver any queued notifications
             transport.deliverQueuedNotifications(sessionId)
@@ -345,8 +363,15 @@ class EnhancedMcpServlet extends HttpServlet {
             // Instead we loop until the writer signals an error (client disconnected).
             int pingCount = 0
             boolean connectionAlive = true
-            while (connectionAlive && pingCount < 360) {  // max ~30 minutes (360 × 5s)
-                Thread.sleep(5000)
+            while (connectionAlive && !shuttingDown && pingCount < 360) {  // max ~30 minutes (360 × 5s)
+                // Sleep 5000ms in increments of 100ms to allow fast shutdown response
+                for (int i = 0; i < 50 && !shuttingDown && transport.isSessionActive(sessionId); i++) {
+                    Thread.sleep(100)
+                }
+                if (shuttingDown || !transport.isSessionActive(sessionId)) {
+                    connectionAlive = false
+                    break
+                }
 
                 if (!transport.sendPing(sessionId)) {
                     logger.debug("Ping failed for session ${sessionId}, ending SSE loop")
@@ -368,10 +393,9 @@ class EnhancedMcpServlet extends HttpServlet {
         } catch (Exception e) {
             logger.warn("Enhanced SSE connection error: ${e.message}", e)
         } finally {
-            // Clean up
             transport.unregisterSseWriter(sessionId)
-
-            // Complete async context if available
+            // Invalidate HTTP session before completing to prevent Jetty session passivation race on shutdown
+            try { request.getSession(false)?.invalidate() } catch (Exception ignored) {}
             if (request.isAsyncStarted()) {
                 try {
                     request.getAsyncContext().complete()
@@ -379,13 +403,14 @@ class EnhancedMcpServlet extends HttpServlet {
                     logger.debug("Error completing async context: ${e.message}")
                 }
             }
+            activeSseCount.decrementAndGet()
         }
     }
 
     private void handleMessage(HttpServletRequest request, HttpServletResponse response, ExecutionContextImpl ec, String requestBody)
             throws IOException {
 
-        String sessionId = request.getHeader("Mcp-Session-Id")
+        String sessionId = request.getHeader("Mcp-Session-Id") ?: request.getParameter("sessionId")
         def session = sessionAdapter.getSession(sessionId)
 
         if (!session) {
@@ -441,23 +466,83 @@ class EnhancedMcpServlet extends HttpServlet {
                 ]))
                 return
             }
+            
+            // Handle notifications (messages without an id)
+            if (!rpcRequest.containsKey('id')) {
+                response.setStatus(HttpServletResponse.SC_ACCEPTED)
+                response.writer.flush()
+                String notifUsername = ec.user.username
+                Thread.start {
+                    def asyncEc = ec.factory.getExecutionContext()
+                    try {
+                        try {
+                            if (notifUsername) {
+                                asyncEc.user.internalLoginUser(notifUsername)
+                            }
+                            if (rpcRequest.method == 'notifications/initialized') {
+                                logger.info("Session ${sessionId} initialized")
+                                sessionAdapter.setSessionState(sessionId, McpSession.STATE_INITIALIZED)
+                            } else {
+                                processMcpMethod(rpcRequest.method, rpcRequest.params, asyncEc, sessionId, null)
+                            }
+                        } catch (Exception e) {
+                            logger.error("Error processing notification for session ${sessionId}: ${e.message}", e)
+                        }
+                    } finally {
+                        asyncEc.destroy()
+                    }
+                }
+                return
+            }
 
-            // Process method with session context
-            def result = processMcpMethod(rpcRequest.method, rpcRequest.params, ec, sessionId, null)
-
+            // Return 202 Accepted immediately to prevent timeout
+            response.setStatus(HttpServletResponse.SC_ACCEPTED)
             response.setContentType("application/json")
             response.setCharacterEncoding("UTF-8")
-            response.setStatus(HttpServletResponse.SC_OK)
-
-            def actualResult = result?.result ?: result
-            response.writer.write(JsonOutput.toJson([
-                jsonrpc: "2.0",
-                id: rpcRequest.id,
-                result: actualResult
-            ]))
-
+            response.writer.flush()
+            
+            // Capture username to restore in async thread
+            String currentUsername = ec.user.username
+            
+            // Offload processing
+            Thread.start {
+                // Initialize a new ExecutionContext for the background thread
+                def asyncEc = ec.factory.getExecutionContext()
+                try {
+                    try {
+                        if (currentUsername) {
+                            asyncEc.user.internalLoginUser(currentUsername)
+                        }
+                        def result = processMcpMethod(rpcRequest.method, rpcRequest.params, asyncEc, sessionId, null)
+                        
+                        if (result != null) {
+                            def actualResult = result?.result ?: result
+                            // Forward response to SSE client
+                            def mcpMessage = [
+                                jsonrpc: "2.0",
+                                id: rpcRequest.id,
+                                result: actualResult
+                            ]
+                            // Call sendToSession to send to SSE clients
+                            sendToSession(sessionId, mcpMessage)
+                        }
+                    } catch (Exception e) {
+                        logger.error("Error processing message for session ${sessionId}: ${e.message}", e)
+                        if (rpcRequest.id != null) {
+                            def errorMsg = [
+                                jsonrpc: "2.0",
+                                error: [code: -32603, message: "Internal error: " + e.message],
+                                id: rpcRequest.id
+                            ]
+                            sendToSession(sessionId, errorMsg)
+                        }
+                    }
+                } finally {
+                    asyncEc.destroy()
+                }
+            }
         } catch (Exception e) {
-            logger.error("Error processing message for session ${sessionId}: ${e.message}", e)
+            logger.error("Error reading JSON-RPC request for session ${sessionId}: ${e.message}", e)
             response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR)
             response.setContentType("application/json")
             response.writer.write(JsonOutput.toJson([
@@ -677,7 +762,7 @@ class EnhancedMcpServlet extends HttpServlet {
     }
 
     private Map<String, Object> processMcpMethod(String method, Map params, ExecutionContextImpl ec, String sessionId, def visit) {
-        logger.debug("Processing MCP method: ${method} with sessionId: ${sessionId}")
+        logger.info("Processing MCP method: ${method} with sessionId: ${sessionId}")
 
         try {
             if (params == null) params = [:]
@@ -957,10 +1042,20 @@ class EnhancedMcpServlet extends HttpServlet {
     @Override
     void destroy() {
         logger.info("Destroying EnhancedMcpServlet")
+        shuttingDown = true
 
         // Close all sessions
         for (String sessionId in sessionAdapter.getAllSessionIds()) {
             transport.closeSession(sessionId)
+        }
+
+        // Wait for SSE threads to complete asyncContext.complete() before Moqui tears down the DB pool
+        long deadline = System.currentTimeMillis() + 3000
+        while (activeSseCount.get() > 0 && System.currentTimeMillis() < deadline) {
+            try { Thread.sleep(50) } catch (InterruptedException ignored) {}
+        }
+        if (activeSseCount.get() > 0) {
+            logger.warn("${activeSseCount.get()} SSE thread(s) still active after shutdown wait")
         }
 
         // Clean up notification bridge

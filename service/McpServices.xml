@@ -142,7 +142,7 @@
                 ]
                 
                 result = [
-                    protocolVersion: "2025-06-18",
+                    protocolVersion: context.protocolVersion ?: "2024-11-05",
                     capabilities: serverCapabilities,
                     serverInfo: serverInfo,
                     sessionId: sessionId,
@@ -240,33 +240,16 @@
                     if (name == "moqui_search_services") {
                         def query = arguments?.query?.toLowerCase()
                         if (!query) throw new Exception("Missing query")
-                        def matchedNames = ec.service.getKnownServiceNames()
-                            .findAll { it.startsWith("growerp.") && it.toLowerCase().contains(query) }
-                            .sort()
-                            .take(30)
-                        def services = matchedNames.collect { svcName ->
-                            def info = [name: svcName]
-                            try {
-                                def sd = ec.service.getServiceDefinition(svcName)
-                                if (sd) {
-                                    def descNode = sd.serviceNode.first("description")
-                                    if (descNode?.text) info.description = descNode.text.trim()
-                                    def required = []
-                                    def optional = []
-                                    sd.getInParameterNames().each { pName ->
-                                        def p = sd.getInParameter(pName)
-                                        if (p?.required) required << pName else optional << pName
-                                    }
-                                    if (required) info.required = required
-                                    if (optional) info.optional = optional
-                                }
-                            } catch (sdEx) { }
-                            return info
-                        }
+                        // Use cached names: avoids getKnownServiceNames() filesystem scan + getServiceDefinition()
+                        // Groovy compilation on every call (which caused class loader deadlocks).
+                        // For parameter details, use moqui_get_service_details.
+                        List<String> allGroWerpNames = org.moqui.mcp.adapter.McpToolAdapter.getCachedGroWerpServiceNames(ec)
+                        def matchedNames = allGroWerpNames.findAll { it.toLowerCase().contains(query) }.take(30)
                         def txt = new groovy.json.JsonBuilder([
                             total: matchedNames.size(),
-                            services: services,
-                            hint: matchedNames.size() == 30 ? "Showing first 30 matches. Narrow your query for better results." : null
+                            services: matchedNames.collect { [name: it] },
+                            hint: matchedNames.size() == 30
+                                ? "Showing first 30 matches. Narrow your query or use moqui_get_service_details for parameter info." : null
                         ]).toString()
                         result = [content: [[type: "text", text: txt]], isError: false]
                         return
@@ -335,7 +318,7 @@
                 } finally {
                     // Send a simple notification about tool execution
                     try {
-                        def servlet = ec.web.getServletContext().getAttribute("enhancedMcpServlet")
+                        def servlet = ec.web?.getServletContext()?.getAttribute("enhancedMcpServlet")
                         if (servlet && sessionId) {
                             def notification = [
                                 method: "notifications/tool_execution",
@@ -3210,6 +3193,13 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
                         ]
                     ]
                 ]
+                
+                try {
+                    def adapter = Class.forName("org.moqui.mcp.adapter.McpToolAdapter")
+                    tools.addAll(adapter.listTools())
+                } catch (ClassNotFoundException e) {
+                    // Ignore if adapter is not found
+                }
                 
                 result = [tools: tools]
             ]]></script>

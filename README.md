@@ -141,11 +141,21 @@ git clone --recursive https://github.com/moqui/moqui-mcp
 
 ### MCP Tools
 
+**Screen tools** (available when the `SimpleScreens` component is loaded, e.g. PopCommerce):
+
 | Tool | Purpose |
 |------|---------|
 | `moqui_browse_screens` | Navigate screens, execute actions, render content |
 | `moqui_search_screens` | Find screens by name |
 | `moqui_get_screen_details` | Get field metadata, dropdown options |
+
+**Service tools** (always available; the primary tools in a GrowERP deployment, also used by the [moqui-adk](../moqui-adk) ADK agent):
+
+| Tool | Purpose |
+|------|---------|
+| `moqui_search_services` | Find Moqui services by keyword query |
+| `moqui_get_service_details` | Get a service's input/output parameters, types, and descriptions |
+| `moqui_execute_service` | Execute a Moqui service with parameters (respects artifact authorization) |
 
 ## Architecture
 

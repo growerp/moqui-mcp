@@ -58,6 +58,38 @@ class McpToolAdapter {
         'moqui_get_help': 'Fetch extended documentation for a screen or service'
     ]
 
+    private static final Map<String, Map> TOOL_SCHEMAS = [:]
+
+    // Static cache: computed once per JVM, avoids repeated filesystem scans in getKnownServiceNames()
+    private static volatile List<String> cachedGroWerpServiceNames = null
+    private static final Object cacheInitLock = new Object()
+
+    static List<String> getCachedGroWerpServiceNames(ExecutionContext ec) {
+        if (cachedGroWerpServiceNames != null) return cachedGroWerpServiceNames
+        synchronized(cacheInitLock) {
+            if (cachedGroWerpServiceNames != null) return cachedGroWerpServiceNames
+            logger.info("McpToolAdapter: building growerp service name cache...")
+            long t = System.currentTimeMillis()
+            cachedGroWerpServiceNames = ec.service.getKnownServiceNames()
+                .findAll { it && it.startsWith("growerp.") }
+                .sort() as List<String>
+            logger.info("McpToolAdapter: cached ${cachedGroWerpServiceNames.size()} growerp service names in ${System.currentTimeMillis() - t}ms")
+            return cachedGroWerpServiceNames
+        }
+    }
+
+    static void clearServiceNameCache() {
+        cachedGroWerpServiceNames = null
+        logger.info("McpToolAdapter: cleared growerp service name cache")
+    }
+
+    static void registerTool(String name, String serviceName, String description, Map schema) {
+        TOOL_SERVICE_MAP.put(name, serviceName)
+        if (description) TOOL_DESCRIPTIONS.put(name, description)
+        if (schema) TOOL_SCHEMAS.put(name, schema)
+        logger.info("McpToolAdapter: registered plugin tool '${name}' -> ${serviceName}")
+    }
+
     /**
      * Call an MCP tool, translating to the appropriate Moqui service
      * @param ec The execution context
@@ -189,13 +221,14 @@ class McpToolAdapter {
      * Get the list of available tools with their definitions
      * @return List of tool definition maps
      */
-    List<Map> listTools() {
+    static List<Map> listTools() {
         return TOOL_SERVICE_MAP.keySet().collect { toolName ->
-            [
+            Map toolDef = [
                 name: toolName,
-                description: TOOL_DESCRIPTIONS.get(toolName) ?: "MCP tool: ${toolName}",
-                serviceName: TOOL_SERVICE_MAP.get(toolName)
+                description: TOOL_DESCRIPTIONS.get(toolName) ?: "MCP tool: ${toolName}"
             ]
+            toolDef.inputSchema = TOOL_SCHEMAS.get(toolName) ?: [type: "object", properties: [:]]
+            return toolDef
         }
     }
 

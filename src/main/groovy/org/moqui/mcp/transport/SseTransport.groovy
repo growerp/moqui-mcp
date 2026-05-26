@@ -304,12 +304,20 @@ class SseTransport implements MoquiMcpTransport {
         }
 
         try {
-            def pingData = [
-                type: "ping",
-                timestamp: System.currentTimeMillis(),
-                sessionId: sessionId
-            ]
-            sendSseEvent(session.sseWriter, "ping", JsonOutput.toJson(pingData))
+            PrintWriter writer = session.sseWriter
+            if (writer == null || writer.checkError()) {
+                throw new IOException("Writer is closed or in error state")
+            }
+            
+            synchronized(writer) {
+                // Standard SSE keep-alive is a comment line starting with a colon
+                writer.write(":ping\n\n")
+                writer.flush()
+            }
+            
+            if (writer.checkError()) {
+                throw new IOException("Client disconnected during write")
+            }
             session.touch()
             return true
         } catch (Exception e) {
@@ -330,10 +338,12 @@ class SseTransport implements MoquiMcpTransport {
         }
 
         long eventId = ++eventIdCounter
-        writer.write("id: ${eventId}\n")
-        writer.write("event: ${eventType}\n")
-        writer.write("data: ${data}\n\n")
-        writer.flush()
+        synchronized(writer) {
+            writer.write("id: ${eventId}\n")
+            writer.write("event: ${eventType}\n")
+            writer.write("data: ${data}\n\n")
+            writer.flush()
+        }
 
         if (writer.checkError()) {
             throw new IOException("Client disconnected during write")
@@ -348,12 +358,14 @@ class SseTransport implements MoquiMcpTransport {
             throw new IOException("Writer is closed or in error state")
         }
 
-        if (eventId >= 0) {
-            writer.write("id: ${eventId}\n")
+        synchronized(writer) {
+            if (eventId >= 0) {
+                writer.write("id: ${eventId}\n")
+            }
+            writer.write("event: ${eventType}\n")
+            writer.write("data: ${data}\n\n")
+            writer.flush()
         }
-        writer.write("event: ${eventType}\n")
-        writer.write("data: ${data}\n\n")
-        writer.flush()
 
         if (writer.checkError()) {
             throw new IOException("Client disconnected during write")
