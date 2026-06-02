@@ -265,8 +265,8 @@
                         sd.getInParameterNames().each { pName ->
                             def p = sd.getInParameter(pName)
                             if (p) {
-                                def pInfo = [type: p.type ?: "String", required: p.required ?: false]
-                                def pDescNode = p.parameterNode?.first("description")
+                                def pInfo = [type: p.attribute("type") ?: "String", required: p.attribute("required") == "true"]
+                                def pDescNode = p.first("description")
                                 if (pDescNode?.text) pInfo.description = pDescNode.text.trim()
                                 inParams[pName] = pInfo
                             }
@@ -275,8 +275,8 @@
                         sd.getOutParameterNames().each { pName ->
                             def p = sd.getOutParameter(pName)
                             if (p) {
-                                def pInfo = [type: p.type ?: "String"]
-                                def pDescNode = p.parameterNode?.first("description")
+                                def pInfo = [type: p.attribute("type") ?: "String"]
+                                def pDescNode = p.first("description")
                                 if (pDescNode?.text) pInfo.description = pDescNode.text.trim()
                                 outParams[pName] = pInfo
                             }
