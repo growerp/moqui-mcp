@@ -118,6 +118,22 @@ class EnhancedMcpServlet extends HttpServlet {
                     } finally {
                         warmEc.destroy()
                     }
+                    // Pre-compile McpServices Groovy scripts so the Groovy global-transform scan
+                    // completes before McpToolset.getTools() is triggered by the first user message.
+                    // Without this, the very first Groovy compilation in the JVM may fail with
+                    // "IO Exception attempting to load global transforms" for groovy-5.0.3.jar,
+                    // causing McpToolset to exhaust its 3 retries and stop retrying permanently.
+                    try {
+                        def preEc = ecfiRef.getEci()
+                        try {
+                            preEc.artifactExecution.disableAuthz()
+                            preEc.service.sync().name('McpServices.mcp#Initialize')
+                                .parameters([protocolVersion: '2024-11-05', sessionId: 'prewarm-compile']).call()
+                        } catch (Exception ignored) { /* expected; compilation side-effect already happened */ }
+                        finally { preEc.destroy() }
+                    } catch (Exception e) {
+                        logger.warn("McpServices prewarm failed: ${e.message}")
+                    }
                 } catch (Exception e) {
                     logger.warn("Service name cache pre-warm failed: ${e.message}")
                 }
