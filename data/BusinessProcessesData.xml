@@ -47,6 +47,17 @@ Each workflow includes:
 - **[Approve an Order](Order-Approval)**: Open an existing order with status preset to Approved for user confirmation
 - **[Receive a Shipment](Shipment-Receive)**: Show incoming shipments or open a shipment's receive screen
 
+## Opening GrowERP front-end screens (generic)
+
+The orders/shipments workflows above are specific examples of a general convention. For ANY
+entity the GrowERP Flutter client exposes a screen catalog (widgetName, description, keywords,
+parameters). To fulfil a request emit a `growerp-action` directive:
+- View/list → `{"action":"navigate","widget":"<Entity>List"}`
+- Create → `{"action":"dialog","widget":"<Entity>Dialog"}` (no id)
+- Open/edit → `{"action":"dialog","widget":"<Entity>Dialog","params":{"<idParam>":"<id>"}}`
+  using the id parameter named in that widget's catalog `parameters` (e.g. productId, partyId).
+Navigate/open only — the user confirms any write on the opened, pre-filled screen.
+
 ## How to Use These Guides
 
 These workflows are designed to be **executable by LLMs**. Each step provides:
