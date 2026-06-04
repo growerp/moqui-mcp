@@ -14,7 +14,7 @@
     xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/moqui-conf-3.xsd">
 
     <webapp-list>
-        <webapp name="webroot" http-port="8080">
+        <webapp name="webroot" http-port="${webapp_http_port}">
             <!-- No McpAuthFilter here: EnhancedMcpServlet handles authentication
                  itself, allowing the unauthenticated MCP handshake (initialize/ping)
                  to pass through before requiring credentials for other methods. -->
