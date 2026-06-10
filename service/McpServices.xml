@@ -175,7 +175,36 @@
                 // Start timing for execution metrics
                 def startTime = System.currentTimeMillis()
                 def isError = false
-                
+
+                // ── Agent trust gate ──────────────────────────────────────────────
+                // Before executing ANY arbitrary Moqui service on behalf of an agent,
+                // ask moqui-adk's governance service to classify/scope/pin-tenant the
+                // call. The hook is optional: when moqui-adk is not installed the gate
+                // is a no-op and MCP behaves exactly as before.
+                def GOV_SVC = "moqui.adk.AdkGovernanceServices.govern#AgentAction"
+                def REC_SVC = "moqui.adk.AdkGovernanceServices.record#AgentResult"
+                def resolveAdkConfigId = {
+                    String cid = null
+                    try { cid = ec.web?.getRequest()?.getHeader('adk_config_id') } catch (ignore) {}
+                    if (!cid) cid = arguments?._adkConfigId
+                    return cid
+                }
+                // returns [allowed:bool, decision:String, args:Map, logId:String, message:String]
+                def applyGate = { String svcName, Map svcArgs ->
+                    if (!ec.service.isServiceDefined(GOV_SVC)) return [allowed: true, args: svcArgs, logId: null]
+                    def gov = ec.service.sync().name(GOV_SVC).parameters([
+                            configId: resolveAdkConfigId(), toolName: name, serviceName: svcName,
+                            parameters: svcArgs, adkSessionId: sessionId]).call()
+                    return [allowed: (gov?.decision == 'allowed'), decision: gov?.decision,
+                            args: (gov?.parameters ?: svcArgs), logId: gov?.adkActionLogId,
+                            message: gov?.message]
+                }
+                def recordResult = { logId, res ->
+                    if (logId && ec.service.isServiceDefined(REC_SVC))
+                        ec.service.sync().name(REC_SVC).parameters([adkActionLogId: logId,
+                            resultSummary: new groovy.json.JsonBuilder(res).toString()]).call()
+                }
+
                 try {
                     // Consolidated Tool Dispatching
 
@@ -232,7 +261,15 @@
                         if (!svcName || !ec.service.isServiceDefined(svcName)) {
                             throw new Exception("Unknown service name: ${svcName}")
                         }
-                        def serviceResult = ec.service.sync().name(svcName).parameters(svcArgs).call()
+                        def gate = applyGate(svcName, svcArgs)
+                        if (!gate.allowed) {
+                            // blocked → error to the agent; pending → not an error, just queued
+                            result = [content: [[type: "text", text: gate.message ?: "Action not permitted"]],
+                                      isError: (gate.decision == 'blocked')]
+                            return
+                        }
+                        def serviceResult = ec.service.sync().name(svcName).parameters(gate.args).call()
+                        recordResult(gate.logId, serviceResult)
                         result = [content: [[type: "text", text: new groovy.json.JsonBuilder(serviceResult).toString()]], isError: false]
                         return
                     }
@@ -293,8 +330,17 @@
 
                     // Fallback: check if it's a general Moqui service (non-screen-based tools)
                     if (ec.service.isServiceDefined(name)) {
+                        def svcArgs = new LinkedHashMap(arguments ?: [:])
+                        svcArgs.remove('_adkConfigId')   // never forward the gate hint to the service
+                        def gate = applyGate(name, svcArgs)
+                        if (!gate.allowed) {
+                            result = [content: [[type: "text", text: gate.message ?: "Action not permitted"]],
+                                      isError: (gate.decision == 'blocked')]
+                            return
+                        }
                         // Execute service with current user context
-                        def serviceResult = ec.service.sync().name(name).parameters(arguments ?: [:]).call()
+                        def serviceResult = ec.service.sync().name(name).parameters(gate.args).call()
+                        recordResult(gate.logId, serviceResult)
                         // Convert result to MCP format for general services
                         result = [content: [[type: "text", text: new JsonBuilder(serviceResult).toString()]], isError: false]
                         return
