@@ -83,7 +83,21 @@ Use the following discovery tools to explore available functionality:
 ### General Tips
 - Use `renderMode: "compact"` for efficient structured output
 - Global navigation (Messages, Tasks, Calendar) available in `globalNav` array
-- Screen paths use forward slash notation: `apps/PopcAdmin/Catalog/Product`]]></fileData>
+- Screen paths use forward slash notation: `apps/PopcAdmin/Catalog/Product`
+
+## REST API for Data Inspection / Debugging
+
+Use `moqui_rest_call` (read-only, GET only) to inspect live data when debugging. `path` is
+relative to `/rest/`:
+- `s1/moqui/...` — Moqui Tools Service REST API
+- `s1/mantle/...` — Mantle USL Service REST API
+- `e1/{Entity}/{id}` — Entity REST API (any entity by name, e.g. `e1/mantle.party.Party/100000`)
+- `m1/{Entity}/{master}/{id}` — Master Entity REST API (entity + dependent records)
+- Filter/page with `queryParameters` (e.g. `{pageSize:'10', orderByField:'lastName'}`)
+- Discover schemas: `service.swagger/moqui.json`, `service.swagger/mantle.json`,
+  `entity.swagger`, `master.swagger`
+
+GET only — no create/update/delete. Restricted to the SystemSupport account.]]></fileData>
     </moqui.resource.DbResourceFile>
 
     <!-- Root Wiki Page -->

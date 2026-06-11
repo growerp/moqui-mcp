@@ -90,9 +90,10 @@
                 // Fallback to hardcoded instructions if wiki not available
                 if (!instructions) {
                     def hasSimpleScreens = ec.factory.getComponentBaseLocations().containsKey("SimpleScreens")
-                    instructions = hasSimpleScreens
+                    def restHint = " For read-only data inspection / debugging, use moqui_rest_call (GET-only) to query any entity (e1/{Entity}, m1/{Entity}/{master}) and the s1/moqui / s1/mantle REST APIs; discover schemas via service.swagger/*.json and entity.swagger. SystemSupport only."
+                    instructions = (hasSimpleScreens
                         ? "This server provides access to Moqui ERP through MCP. Use moqui_browse_screens(path='/PopCommerce') to begin. Key screens include: /PopCommerce/Catalog/Product/FindProduct for products, /PopCommerce/Order/FindOrder for orders, and /PopCommerce/Customer for customer management. All screens support parameterized queries for filtering results."
-                        : "This server provides access to GrowERP through MCP. Use moqui_search_services to find available services, moqui_get_service_details to learn required parameters, and moqui_execute_service to run them."
+                        : "This server provides access to GrowERP through MCP. Use moqui_search_services to find available services, moqui_get_service_details to learn required parameters, and moqui_execute_service to run them.") + restHint
                 }
                 
                 // Build server capabilities - don't fetch actual tools/resources during init
@@ -238,7 +239,8 @@
                         "moqui_get_screen_details": "McpServices.mcp#GetScreenDetails",
                         "moqui_get_help": "McpServices.mcp#GetHelp",
                         "moqui_prompts_list": "McpServices.mcp#PromptsList",
-                        "moqui_prompts_get": "McpServices.mcp#PromptsGet"
+                        "moqui_prompts_get": "McpServices.mcp#PromptsGet",
+                        "moqui_rest_call": "McpServices.mcp#RestCall"
                         // "moqui_batch_operations": "McpServices.mcp#BatchOperations" - hidden until fixed
                     ]
                     
@@ -3160,6 +3162,101 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
         </actions>
     </service>
 
+    <service verb="mcp" noun="RestCall" authenticate="true" allow-remote="true"
+        transaction-timeout="120">
+        <description>Read-only (GET) proxy to the Moqui REST API for data inspection / debugging.
+            Loops back to /rest/{path} forwarding the inbound Basic auth credential. Restricted to the
+            SystemSupport account (configurable via moqui.mcp.rest.allowed.username). Covers the Service REST
+            API (s1/moqui, s1/mantle), the Entity/Master REST API (e1/{Entity}, m1/{Entity}/{master}) and the
+            schema/swagger discovery endpoints. No mutating verbs are ever issued.</description>
+        <in-parameters>
+            <parameter name="path" required="true">
+                <description>REST path relative to /rest/ (leading '/' or 'rest/' is stripped), e.g.
+                    's1/mantle/products', 'e1/mantle.party.Party/100000', 'service.swagger/moqui.json'.</description>
+            </parameter>
+            <parameter name="queryParameters" type="Map"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="result" type="Map"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                import org.moqui.context.ExecutionContext
+                import org.moqui.util.RestClient
+                import groovy.json.JsonBuilder
+
+                ExecutionContext ec = context.ec
+
+                def errorResult = { String msg ->
+                    return [content: [[type: "text", text: msg]], isError: true]
+                }
+
+                // ── 1. SystemSupport-only guard (username, never a password literal) ──
+                String allowedUser = System.getProperty("moqui.mcp.rest.allowed.username", "SystemSupport")
+                if (ec.user.username != allowedUser) {
+                    result = errorResult("REST API access is restricted to the ${allowedUser} account (current user: ${ec.user.username ?: 'anonymous'}).")
+                    return
+                }
+
+                // ── 2. Require the inbound Basic auth credential to forward (no embedded fallback) ──
+                String authHdr = null
+                try { authHdr = ec.web?.getRequest()?.getHeader('Authorization') } catch (ignore) {}
+                if (!authHdr) {
+                    result = errorResult("No inbound Authorization credential available to forward to the REST API.")
+                    return
+                }
+
+                // ── 3. Normalise path: strip leading slash and optional 'rest/' prefix; GET only ──
+                String relPath = (path ?: "").trim()
+                while (relPath.startsWith("/")) relPath = relPath.substring(1)
+                if (relPath.toLowerCase().startsWith("rest/")) relPath = relPath.substring(5)
+                if (!relPath) { result = errorResult("Empty REST path."); return }
+
+                // ── 4. Build URL: base + /rest/ + path + encoded query string ──
+                String baseUrl = System.getProperty("moqui.mcp.rest.base.url", "http://localhost:8080")
+                while (baseUrl.endsWith("/")) baseUrl = baseUrl.substring(0, baseUrl.length() - 1)
+                StringBuilder urlSb = new StringBuilder(baseUrl).append("/rest/").append(relPath)
+                if (queryParameters instanceof Map && !queryParameters.isEmpty()) {
+                    urlSb.append(relPath.contains("?") ? "&" : "?")
+                    boolean first = true
+                    queryParameters.each { k, v ->
+                        if (v == null) return
+                        if (!first) urlSb.append("&")
+                        urlSb.append(java.net.URLEncoder.encode(k.toString(), "UTF-8"))
+                           .append("=").append(java.net.URLEncoder.encode(v.toString(), "UTF-8"))
+                        first = false
+                    }
+                }
+                String url = urlSb.toString()
+
+                // ── 5. Loopback GET, forwarding the caller's credential ──
+                try {
+                    RestClient rc = ec.service.rest().method(RestClient.GET).uri(url)
+                    rc.addHeader("Authorization", authHdr)
+                    rc.addHeader("Accept", "application/json")
+                    RestClient.RestResponse resp = rc.call()
+                    int sc = resp.statusCode
+
+                    Object body
+                    try { body = resp.jsonObject() } catch (Exception je) { body = resp.text() }
+
+                    if (sc < 200 || sc >= 300) {
+                        result = [content: [[type: "text", text: new JsonBuilder([
+                                statusCode: sc, error: true, path: relPath, response: body]).toString()]],
+                                isError: true]
+                    } else {
+                        result = [content: [[type: "text", text: new JsonBuilder([
+                                statusCode: sc, path: relPath, response: body]).toString()]],
+                                isError: false]
+                    }
+                } catch (Exception e) {
+                    ec.logger.warn("moqui_rest_call GET ${url} failed: ${e.message}")
+                    result = errorResult("REST call failed for path '${relPath}': ${e.message}")
+                }
+            ]]></script>
+        </actions>
+    </service>
+
     <service verb="list" noun="Tools" authenticate="false" allow-remote="true"
         transaction-timeout="60">
         <description>List discovery tools and the unified screen renderer.</description>
@@ -3236,6 +3333,19 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
                                 "parameters": [type: "object", description: "Input parameters for the service (required params must be provided)"]
                             ],
                             required: ["serviceName"]
+                        ]
+                    ],
+                    [
+                        name: "moqui_rest_call",
+                        title: "Moqui REST API (read-only)",
+                        description: "Read-only (GET) call to the Moqui REST API for debugging and data inspection. 'path' is relative to /rest/ — e.g. 's1/moqui/...' (Moqui Tools API), 's1/mantle/...' (Mantle USL API), 'e1/{Entity}/{id}' and 'm1/{Entity}/{master}/{id}' (entity / master-entity API, any entity by name). Filter/page with queryParameters (e.g. {pageSize:'5', statusId:'...', orderByField:'...'}). Discover endpoints/schemas via 'service.swagger/moqui.json', 'service.swagger/mantle.json', 'entity.swagger', 'master.swagger'. GET only — no create/update/delete. Restricted to the SystemSupport account.",
+                        inputSchema: [
+                            type: "object",
+                            properties: [
+                                "path": [type: "string", description: "REST path relative to /rest/ (e.g. 'e1/mantle.party.Party/100000', 's1/mantle/products', 'service.swagger/moqui.json')"],
+                                "queryParameters": [type: "object", description: "Optional query/filter parameters appended to the request (e.g. {pageSize:'10', orderByField:'lastName'})"]
+                            ],
+                            required: ["path"]
                         ]
                     ]
                 ]
