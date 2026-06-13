@@ -182,8 +182,8 @@
                 // ask moqui-adk's governance service to classify/scope/pin-tenant the
                 // call. The hook is optional: when moqui-adk is not installed the gate
                 // is a no-op and MCP behaves exactly as before.
-                def GOV_SVC = "moqui.adk.AdkGovernanceServices.govern#AgentAction"
-                def REC_SVC = "moqui.adk.AdkGovernanceServices.record#AgentResult"
+                def GOV_SVC = "AdkGovernanceServices.govern#AgentAction"
+                def REC_SVC = "AdkGovernanceServices.record#AgentResult"
                 def resolveAdkConfigId = {
                     String cid = null
                     try { cid = ec.web?.getRequest()?.getHeader('adk_config_id') } catch (ignore) {}
@@ -286,7 +286,7 @@
                                     .condition('adkAgentConfigId', cid).disableAuthz().one()
                             owner = cfg?.ownerPartyId
                         }
-                        def kSvc = "moqui.adk.AdkKnowledgeServices.search#AdkKnowledge"
+                        def kSvc = "AdkKnowledgeServices.search#AdkKnowledge"
                         if (!owner || !ec.service.isServiceDefined(kSvc)) {
                             result = [content: [[type: "text", text: "No company knowledge base is available in this context."]], isError: true]
                             return
