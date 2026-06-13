@@ -276,6 +276,40 @@
                         return
                     }
 
+                    if (name == "searchKnowledge") {
+                        // Resolve the calling agent's tenant (same configId→owner path as the
+                        // governance gate), search the owner's knowledge base, and audit it.
+                        def cid = resolveAdkConfigId()
+                        def owner = null
+                        if (cid) {
+                            def cfg = ec.entity.find('moqui.adk.AdkAgentConfig')
+                                    .condition('adkAgentConfigId', cid).disableAuthz().one()
+                            owner = cfg?.ownerPartyId
+                        }
+                        def kSvc = "moqui.adk.AdkKnowledgeServices.search#AdkKnowledge"
+                        if (!owner || !ec.service.isServiceDefined(kSvc)) {
+                            result = [content: [[type: "text", text: "No company knowledge base is available in this context."]], isError: true]
+                            return
+                        }
+                        def kRes = ec.service.sync().name(kSvc).parameters([
+                                ownerPartyId: owner, query: arguments?.query,
+                                limit: (arguments?.limit ?: 5)]).call()
+                        def rows = kRes?.results ?: []
+                        def txt = rows.isEmpty() ? "No matching company knowledge found." :
+                                rows.collect { "• ${it.title ? (it.title + ': ') : ''}${it.text}" }.join("\n\n")
+                        // Audit (read) — best effort, mirrors the governance log.
+                        try {
+                            if (ec.service.isServiceDefined("create#moqui.adk.AdkActionLog"))
+                                ec.service.sync().name("create#moqui.adk.AdkActionLog").parameters([
+                                    ownerPartyId: owner, configId: cid, toolName: 'searchKnowledge',
+                                    serviceName: kSvc, verbClass: 'read', decision: 'allowed',
+                                    argsJson: new groovy.json.JsonBuilder(arguments ?: [:]).toString(),
+                                    resultSummary: "${rows.size()} passage(s)", actionTime: ec.user.nowTimestamp]).call()
+                        } catch (Exception ignore) {}
+                        result = [content: [[type: "text", text: txt]], isError: false]
+                        return
+                    }
+
                     if (name == "moqui_search_services") {
                         def query = arguments?.query?.toLowerCase()
                         if (!query) throw new Exception("Missing query")
@@ -3347,9 +3381,22 @@ def wikiInstructions = getWikiInstructions(inputScreenPath)
                             ],
                             required: ["path"]
                         ]
+                    ],
+                    [
+                        name: "searchKnowledge",
+                        title: "Search Company Knowledge",
+                        description: "Search THIS company's knowledge base (uploaded documents, policies, notes) for passages relevant to a question. Use it for company-specific information that is not in the live ERP data — policies, procedures, product descriptions. Returns the most relevant passages; cite them and do not invent facts not present.",
+                        inputSchema: [
+                            type: "object",
+                            properties: [
+                                "query": [type: "string", description: "The question or topic to find relevant company knowledge for"],
+                                "limit": [type: "integer", description: "Max passages to return (default 5)"]
+                            ],
+                            required: ["query"]
+                        ]
                     ]
                 ]
-                
+
                 try {
                     def adapter = Class.forName("org.moqui.mcp.adapter.McpToolAdapter")
                     tools.addAll(adapter.listTools())
