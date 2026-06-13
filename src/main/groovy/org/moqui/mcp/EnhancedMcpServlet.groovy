@@ -57,6 +57,18 @@ class EnhancedMcpServlet extends HttpServlet {
     // Visit cache to reduce database access and prevent lock contention
     private final Map<String, EntityValue> visitCache = new java.util.concurrent.ConcurrentHashMap<>()
 
+    // ADK agent identity captured from the SSE-connect request headers, keyed by MCP
+    // sessionId. Tool calls dispatch on a detached worker thread with no HttpServletRequest,
+    // so the governance gate / searchKnowledge resolve the calling agent + tenant by
+    // sessionId from here instead of from request headers. (static: shared with McpServices.xml)
+    static final Map<String, Map<String, String>> adkSessionHeaders =
+            new java.util.concurrent.ConcurrentHashMap<>()
+
+    /** Headers captured for an MCP sessionId, e.g. [configId:.., owner:..]; null if none. */
+    static Map<String, String> getAdkHeaders(String sessionId) {
+        sessionId ? adkSessionHeaders.get(sessionId) : null
+    }
+
     // Throttled session activity tracking
     private final Map<String, Long> lastActivityUpdate = new java.util.concurrent.ConcurrentHashMap<>()
     private static final long ACTIVITY_UPDATE_INTERVAL_MS = 30000 // 30 seconds
@@ -358,6 +370,20 @@ class EnhancedMcpServlet extends HttpServlet {
         response.setHeader("X-Accel-Buffering", "no")
         response.setHeader("Mcp-Session-Id", sessionId)
 
+        // Capture the calling ADK agent's identity (config + tenant owner) from the SSE
+        // request headers — the only point we still have the HttpServletRequest. Tool calls
+        // resolve it back by sessionId (see getAdkHeaders / McpServices.xml).
+        try {
+            String adkCid   = request.getHeader("adk_config_id")
+            String adkOwner = request.getHeader("adk_owner_party_id")
+            if (adkCid || adkOwner) {
+                adkSessionHeaders.put(sessionId, [configId: adkCid, owner: adkOwner])
+                logger.info("Captured ADK headers for session ${sessionId}: configId=${adkCid}, owner=${adkOwner}")
+            }
+        } catch (Exception e) {
+            logger.warn("Could not capture ADK headers for session ${sessionId}: ${e.message}")
+        }
+
         // Register SSE writer with transport
         transport.registerSseWriter(sessionId, response.writer)
 
@@ -410,6 +436,7 @@ class EnhancedMcpServlet extends HttpServlet {
             logger.warn("Enhanced SSE connection error: ${e.message}", e)
         } finally {
             transport.unregisterSseWriter(sessionId)
+            adkSessionHeaders.remove(sessionId)
             // Invalidate HTTP session before completing to prevent Jetty session passivation race on shutdown
             try { request.getSession(false)?.invalidate() } catch (Exception ignored) {}
             if (request.isAsyncStarted()) {

@@ -184,11 +184,25 @@
                 // is a no-op and MCP behaves exactly as before.
                 def GOV_SVC = "AdkGovernanceServices.govern#AgentAction"
                 def REC_SVC = "AdkGovernanceServices.record#AgentResult"
+                // Tool calls dispatch on a detached worker thread with no HttpServletRequest,
+                // so the agent identity captured at SSE-connect is resolved by MCP sessionId.
+                def adkHdrs = null
+                try { adkHdrs = org.moqui.mcp.EnhancedMcpServlet.getAdkHeaders(sessionId) } catch (ignore) {}
                 def resolveAdkConfigId = {
                     String cid = null
                     try { cid = ec.web?.getRequest()?.getHeader('adk_config_id') } catch (ignore) {}
                     if (!cid) cid = arguments?._adkConfigId
+                    if (!cid) cid = adkHdrs?.configId
                     return cid
+                }
+                // Tenant owner fallback: the general per-tenant interactive agent has no
+                // AdkAgentConfig row, so it sends the owner directly via this header.
+                def resolveAdkOwner = {
+                    String o = null
+                    try { o = ec.web?.getRequest()?.getHeader('adk_owner_party_id') } catch (ignore) {}
+                    if (!o) o = arguments?._adkOwnerPartyId
+                    if (!o) o = adkHdrs?.owner
+                    return o
                 }
                 // returns [allowed:bool, decision:String, args:Map, logId:String, message:String]
                 def applyGate = { String svcName, Map svcArgs ->
@@ -286,6 +300,8 @@
                                     .condition('adkAgentConfigId', cid).disableAuthz().one()
                             owner = cfg?.ownerPartyId
                         }
+                        // Fallback for the general per-tenant interactive agent (no config row).
+                        if (!owner) owner = resolveAdkOwner()
                         def kSvc = "AdkKnowledgeServices.search#AdkKnowledge"
                         if (!owner || !ec.service.isServiceDefined(kSvc)) {
                             result = [content: [[type: "text", text: "No company knowledge base is available in this context."]], isError: true]
