@@ -274,6 +274,31 @@
                     if (name == "moqui_execute_service") {
                         def svcName = arguments?.serviceName
                         def svcArgs = arguments?.parameters ?: [:]
+                        // Auto-correct missing # separator (same as moqui_get_service_details)
+                        if (svcName && !svcName.contains('#') && !ec.service.isServiceDefined(svcName)) {
+                            def verbs = ['get','create','update','delete','find','store','check',
+                                'send','run','register','login','logout','search','submit',
+                                'receive','reset','close','recalculate','list','add','remove',
+                                'ingest','push','ensure','escalate','reply','process','set',
+                                'calculate','validate','approve','cancel','complete','draft',
+                                'generate','publish','mark','test','start','pause']
+                            def lastDot = svcName.lastIndexOf('.')
+                            if (lastDot > 0) {
+                                def tail = svcName.substring(lastDot + 1)
+                                for (v in verbs) {
+                                    if (tail.startsWith(v) && tail.length() > v.length() &&
+                                            Character.isUpperCase(tail.charAt(v.length()))) {
+                                        def corrected = svcName.substring(0, lastDot + 1) +
+                                            v + '#' + tail.substring(v.length())
+                                        if (ec.service.isServiceDefined(corrected)) {
+                                            ec.logger.info("MCP: auto-corrected service name '${svcName}' → '${corrected}'")
+                                            svcName = corrected
+                                            break
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if (!svcName || !ec.service.isServiceDefined(svcName)) {
                             throw new Exception("Unknown service name: ${svcName}")
                         }
@@ -347,6 +372,32 @@
                     if (name == "moqui_get_service_details") {
                         def svcName = arguments?.serviceName
                         if (!svcName) throw new Exception("Missing serviceName")
+                        // Auto-correct missing # separator: LLMs often write
+                        // "OrderServices.getSalesOrders" instead of "OrderServices.get#SalesOrders"
+                        if (!svcName.contains('#') && !ec.service.isServiceDefined(svcName)) {
+                            def verbs = ['get','create','update','delete','find','store','check',
+                                'send','run','register','login','logout','search','submit',
+                                'receive','reset','close','recalculate','list','add','remove',
+                                'ingest','push','ensure','escalate','reply','process','set',
+                                'calculate','validate','approve','cancel','complete','draft',
+                                'generate','publish','mark','test','start','pause']
+                            def lastDot = svcName.lastIndexOf('.')
+                            if (lastDot > 0) {
+                                def tail = svcName.substring(lastDot + 1)
+                                for (v in verbs) {
+                                    if (tail.startsWith(v) && tail.length() > v.length() &&
+                                            Character.isUpperCase(tail.charAt(v.length()))) {
+                                        def corrected = svcName.substring(0, lastDot + 1) +
+                                            v + '#' + tail.substring(v.length())
+                                        if (ec.service.isServiceDefined(corrected)) {
+                                            ec.logger.info("MCP: auto-corrected service name '${svcName}' → '${corrected}'")
+                                            svcName = corrected
+                                            break
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         def sd = ec.service.getServiceDefinition(svcName)
                         if (!sd) throw new Exception("Unknown service: ${svcName}")
                         def descNode = sd.serviceNode.first("description")
