@@ -219,6 +219,49 @@
                         ec.service.sync().name(REC_SVC).parameters([adkActionLogId: logId,
                             resultSummary: new groovy.json.JsonBuilder(res).toString()]).call()
                 }
+                // Closest real growerp.* service names for a bad/guessed name → recovery hint.
+                def suggestVerbs = ['get','create','update','delete','find','store','check','send',
+                    'run','register','login','logout','search','submit','receive','reset','close',
+                    'recalculate','list','add','remove','ingest','push','ensure','escalate','reply',
+                    'process','set','calculate','validate','approve','cancel','complete','draft',
+                    'generate','publish','mark','test','start','pause'] as Set
+                // Domain aliases: some list/read operations live on a generic service whose
+                // NAME lacks the domain noun — orders, invoices, shipments, payments and
+                // transactions are all "FinDoc", listed via FinDocServices100.get#FinDoc. A
+                // name-only search/suggest can't find them, so map those nouns → the real service.
+                def finDocTerms = ['order','invoice','shipment','payment','transaction',
+                    'findoc','financial document'] as Set
+                def domainAliasFor = { String q ->
+                    if (!q) return []
+                    def low = q.toLowerCase()
+                    finDocTerms.any { low.contains(it) }
+                        ? ['growerp.100.FinDocServices100.get#FinDoc'] : []
+                }
+                def suggestServices = { String badName, int max ->
+                    if (!badName) return []
+                    def aliases = domainAliasFor(badName)
+                    def names = org.moqui.mcp.adapter.McpToolAdapter.getCachedGroWerpServiceNames(ec)
+                    // tokens from the tail (after last '.'), camelCase-split, drop '#', lowercase
+                    def tail = badName.contains('.') ? badName.substring(badName.lastIndexOf('.') + 1) : badName
+                    def raw = tail.replace('#',' ')
+                        .replaceAll(/([a-z])([A-Z])/, '$1 $2')
+                        .toLowerCase().split(/\s+/).findAll { it.length() > 2 } as List
+                    // prefer noun tokens; verbs like get/create match too many services and add noise
+                    def nouns = raw.findAll { !suggestVerbs.contains(it) }
+                    def base = (nouns ?: raw) as List
+                    // add singular forms so 'orders' matches 'Order'
+                    def toks = (base + base.findAll { it.endsWith('s') && it.length() > 3 }.collect { it[0..-2] }) as Set
+                    if (!toks) return []
+                    def scored = names.collect { n ->
+                            def low = n.toLowerCase()
+                            [name: n, score: toks.count { low.contains(it) }]
+                        }
+                        .findAll { it.score > 0 }
+                        .sort { -it.score }
+                        .collect { it.name }
+                    // Surface domain-alias services (e.g. get#FinDoc for 'order') first.
+                    (aliases + scored.findAll { !aliases.contains(it) }).take(max)
+                }
 
                 try {
                     // Consolidated Tool Dispatching
@@ -300,7 +343,10 @@
                             }
                         }
                         if (!svcName || !ec.service.isServiceDefined(svcName)) {
-                            throw new Exception("Unknown service name: ${svcName}. Use moqui_search_services first to find valid service names.")
+                            def sugg = suggestServices(svcName, 5)
+                            def hint = sugg ? " Did you mean: ${sugg.join(', ')}?"
+                                : " Use moqui_search_services to find valid names."
+                            throw new Exception("Unknown service name: ${svcName}. Only growerp.* services are callable.${hint}")
                         }
                         def gate = applyGate(svcName, svcArgs)
                         if (!gate.allowed) {
@@ -358,12 +404,22 @@
                         // Groovy compilation on every call (which caused class loader deadlocks).
                         // For parameter details, use moqui_get_service_details.
                         List<String> allGroWerpNames = org.moqui.mcp.adapter.McpToolAdapter.getCachedGroWerpServiceNames(ec)
-                        def matchedNames = allGroWerpNames.findAll { it.toLowerCase().contains(query) }.take(30)
+                        def nameMatches = allGroWerpNames.findAll { it.toLowerCase().contains(query) }
+                        // Prepend domain-alias services whose name lacks the noun (orders/invoices/
+                        // shipments/payments/transactions are all listed via get#FinDoc).
+                        def aliasNames = domainAliasFor(query).findAll { !nameMatches.contains(it) }
+                        def matchedNames = (aliasNames + nameMatches).take(30)
+                        def findocHint = aliasNames
+                            ? "Orders, invoices, shipments, payments and transactions are 'financial documents' — list them with growerp.100.FinDocServices100.get#FinDoc (set docType e.g. 'order' and sales=true/false)."
+                            : null
                         def txt = new groovy.json.JsonBuilder([
                             total: matchedNames.size(),
                             services: matchedNames.collect { [name: it] },
-                            hint: matchedNames.size() == 30
-                                ? "Showing first 30 matches. Narrow your query or use moqui_get_service_details for parameter info." : null
+                            hint: findocHint ?: (matchedNames.size() == 30
+                                ? "Showing first 30 matches. Narrow your query or use moqui_get_service_details for parameter info."
+                                : (matchedNames.isEmpty()
+                                    ? "No matches. Search by a single noun keyword (e.g. 'order', 'invoice', 'product') rather than a full or guessed service path. Only growerp.* services are callable."
+                                    : null))
                         ]).toString()
                         result = [content: [[type: "text", text: txt]], isError: false]
                         return
@@ -399,7 +455,12 @@
                             }
                         }
                         def sd = ec.service.getServiceDefinition(svcName)
-                        if (!sd) throw new Exception("Unknown service: ${svcName}. Use moqui_search_services first to find valid service names.")
+                        if (!sd) {
+                            def sugg = suggestServices(svcName, 5)
+                            def hint = sugg ? " Did you mean: ${sugg.join(', ')}?"
+                                : " Use moqui_search_services to find valid names."
+                            throw new Exception("Unknown service: ${svcName}. Only growerp.* services are callable.${hint}")
+                        }
                         def descNode = sd.serviceNode.first("description")
                         def inParams = [:]
                         sd.getInParameterNames().each { pName ->
