@@ -112,7 +112,7 @@ class SseTransport implements MoquiMcpTransport {
         if (!notification.jsonrpc) {
             notification = [
                 jsonrpc: "2.0",
-                method: notification.method ?: "notifications/message",
+                method: notification.method ?: "notifications/moqui/message",
                 params: notification.params ?: notification
             ]
         }
@@ -183,7 +183,7 @@ class SseTransport implements MoquiMcpTransport {
         if (!notification.jsonrpc) {
             notification = [
                 jsonrpc: "2.0",
-                method: notification.method ?: "notifications/message",
+                method: notification.method ?: "notifications/moqui/message",
                 params: notification.params ?: notification
             ]
         }

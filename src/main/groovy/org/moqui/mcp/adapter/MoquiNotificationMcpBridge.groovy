@@ -13,6 +13,7 @@
  */
 package org.moqui.mcp.adapter
 
+import groovy.json.JsonOutput
 import org.moqui.context.ExecutionContextFactory
 import org.moqui.context.NotificationMessage
 import org.moqui.context.NotificationMessageListener
@@ -118,15 +119,19 @@ class MoquiNotificationMcpBridge implements NotificationMessageListener {
             jsonrpc: "2.0",
             method: "notifications/message",
             params: [
-                topic: nm.topic,
-                subTopic: nm.subTopic,
-                title: nm.title,
-                type: nm.type,
-                message: nm.getMessageMap() ?: [:],
-                link: nm.link,
-                showAlert: nm.isShowAlert(),
-                notificationMessageId: nm.notificationMessageId,
-                timestamp: System.currentTimeMillis()
+                level: "info",
+                logger: nm.topic ?: "moqui",
+                data: JsonOutput.toJson([
+                    topic: nm.topic,
+                    subTopic: nm.subTopic,
+                    title: nm.title,
+                    type: nm.type,
+                    message: nm.getMessageMap() ?: [:],
+                    link: nm.link,
+                    showAlert: nm.isShowAlert(),
+                    notificationMessageId: nm.notificationMessageId,
+                    timestamp: System.currentTimeMillis()
+                ])
             ]
         ]
     }
@@ -148,10 +153,14 @@ class MoquiNotificationMcpBridge implements NotificationMessageListener {
             jsonrpc: "2.0",
             method: "notifications/message",
             params: [
-                topic: topic,
-                title: title,
-                message: message,
-                timestamp: System.currentTimeMillis()
+                level: "info",
+                logger: topic ?: "moqui.notification",
+                data: JsonOutput.toJson([
+                    topic: topic,
+                    title: title,
+                    message: message,
+                    timestamp: System.currentTimeMillis()
+                ])
             ]
         ]
 
@@ -181,10 +190,14 @@ class MoquiNotificationMcpBridge implements NotificationMessageListener {
             jsonrpc: "2.0",
             method: "notifications/message",
             params: [
-                topic: topic,
-                title: title,
-                message: message,
-                timestamp: System.currentTimeMillis()
+                level: "info",
+                logger: topic ?: "moqui.notification",
+                data: JsonOutput.toJson([
+                    topic: topic,
+                    title: title,
+                    message: message,
+                    timestamp: System.currentTimeMillis()
+                ])
             ]
         ]
 

@@ -300,7 +300,7 @@
                             }
                         }
                         if (!svcName || !ec.service.isServiceDefined(svcName)) {
-                            throw new Exception("Unknown service name: ${svcName}")
+                            throw new Exception("Unknown service name: ${svcName}. Use moqui_search_services first to find valid service names.")
                         }
                         def gate = applyGate(svcName, svcArgs)
                         if (!gate.allowed) {
@@ -399,7 +399,7 @@
                             }
                         }
                         def sd = ec.service.getServiceDefinition(svcName)
-                        if (!sd) throw new Exception("Unknown service: ${svcName}")
+                        if (!sd) throw new Exception("Unknown service: ${svcName}. Use moqui_search_services first to find valid service names.")
                         def descNode = sd.serviceNode.first("description")
                         def inParams = [:]
                         sd.getInParameterNames().each { pName ->
