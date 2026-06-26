@@ -356,10 +356,13 @@ class EnhancedMcpServlet extends HttpServlet {
             }
         }
 
-        // Enable async support for SSE
-        if (request.isAsyncSupported()) {
-            request.startAsync()
-        }
+        // NOTE: deliberately NOT calling request.startAsync() here. This handler streams the SSE
+        // response synchronously, blocking this request thread in the keep-alive loop below for the
+        // life of the connection (thread-per-SSE). Once startAsync() is called Jetty switches the
+        // output to async mode, where blocking writes/flushes from a thread that never returns to
+        // the container get aggregated instead of pushed to the socket — so the `endpoint` event is
+        // never delivered and legacy HTTP+SSE clients (google-adk McpToolset) time out after 300s.
+        // The periodic ping (every 5s) keeps the connection from hitting Jetty's idle timeout.
 
         // Set SSE headers
         response.setContentType("text/event-stream")
@@ -398,6 +401,12 @@ class EnhancedMcpServlet extends HttpServlet {
 
             // Deliver any queued notifications
             transport.deliverQueuedNotifications(sessionId)
+
+            // Commit the response to the network so the SSE stream actually starts. PrintWriter.flush()
+            // alone only flushes into Jetty's output buffer; without flushBuffer() the endpoint event is
+            // never sent to the socket, so a legacy HTTP+SSE client (google-adk McpToolset) waits for the
+            // endpoint event forever and times out (300s) instead of POSTing initialize/tools/list.
+            response.flushBuffer()
 
             // Keep connection alive with periodic pings.
             // NOTE: response.isCommitted() is TRUE once headers are flushed, so we must NOT
