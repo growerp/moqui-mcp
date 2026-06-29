@@ -488,24 +488,48 @@
         <description>Scheduled service to pick up pending LLM requests and process them.</description>
         <actions>
             <script><![CDATA[
+                // Cap retries: a task that keeps failing (SmsgError, or stuck on SmsgReceived because the
+                // turn threw and rolled back) would otherwise be re-run — and re-billed to the LLM — every
+                // poll forever. After MAX_ATTEMPTS it is parked as SmsgRejected and ignored.
+                int MAX_ATTEMPTS = (System.getenv('AGENT_QUEUE_MAX_ATTEMPTS') ?: '3') as int
                 ec.logger.info("POLL AGENT QUEUE: Checking for LLM request messages...")
-                
+
                 // Find pending LLM requests (both patterns)
                 def pendingTasks = ec.entity.find("moqui.service.message.SystemMessage")
                     .condition("statusId", "in", ["SmsgReceived", "SmsgError"])
                     .condition("systemMessageTypeId", "in", ["SmtyAgentTask", "SmtyLlmRequest"])
+                    .orderBy("initDate")
                     .limit(5)
                     .disableAuthz()
                     .list()
-                
+
                 ec.logger.info("POLL AGENT QUEUE: Found ${pendingTasks.size()} tasks to process.")
-                
+
                 pendingTasks.each { task ->
-                    ec.logger.info("POLL AGENT QUEUE: Processing task ${task.systemMessageId}")
-                    
-                    ec.service.sync().name("AgentServices.run#AgentTaskTurn")
-                        .parameters([systemMessageId: task.systemMessageId])
-                        .call()
+                    int attempts = (task.failCount ?: 0) as int
+                    if (attempts >= MAX_ATTEMPTS) {
+                        ec.service.sync().name("update#moqui.service.message.SystemMessage")
+                            .parameters([systemMessageId: task.systemMessageId, statusId: "SmsgRejected"])
+                            .disableAuthz().requireNewTransaction(true).call()
+                        ec.logger.warn("POLL AGENT QUEUE: task ${task.systemMessageId} exceeded ${MAX_ATTEMPTS} attempts; parked as SmsgRejected")
+                        return  // skip to next task
+                    }
+
+                    // Record the attempt in its OWN transaction so the count survives even if the
+                    // turn below throws and rolls back (otherwise the counter would never advance).
+                    ec.service.sync().name("update#moqui.service.message.SystemMessage")
+                        .parameters([systemMessageId: task.systemMessageId,
+                                     failCount: attempts + 1, lastAttemptDate: ec.user.nowTimestamp])
+                        .disableAuthz().requireNewTransaction(true).call()
+
+                    ec.logger.info("POLL AGENT QUEUE: Processing task ${task.systemMessageId} (attempt ${attempts + 1}/${MAX_ATTEMPTS})")
+                    try {
+                        ec.service.sync().name("AgentServices.run#AgentTaskTurn")
+                            .parameters([systemMessageId: task.systemMessageId])
+                            .call()
+                    } catch (Throwable t) {
+                        ec.logger.error("POLL AGENT QUEUE: turn failed for ${task.systemMessageId}: ${t.message}", t)
+                    }
                 }
             ]]></script>
         </actions>
